@@ -25,8 +25,14 @@ jobs:
           cp LFGFilter.toc LFGFilter.lua LFGFilter/
           zip -r LFGFilter-${{ steps.version.outputs.version }}.zip LFGFilter/
 
+      - name: Create release.json for WoWUp
+        run: |
+          echo '{"releases":[{"filename":"LFGFilter-${{ steps.version.outputs.version }}.zip","nolib":false,"metadata":[{"flavor":"bcc","interface":20504}]}]}' > release.json
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: LFGFilter-${{ steps.version.outputs.version }}.zip
+          files: |
+            LFGFilter-${{ steps.version.outputs.version }}.zip
+            release.json
           generate_release_notes: true
