@@ -1,0 +1,8 @@
+## Interface: 20504
+## Title: LFG Filter
+## Notes: Adds class and role filtering to the TBC Anniversary Looking For Group browser
+## Author: Tuesdays
+## Version: 1.0.0
+## SavedVariables: LFGFilterDB
+
+LFGFilter.lua
