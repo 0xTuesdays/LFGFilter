@@ -4,13 +4,22 @@ Adds class and role filtering to the TBC Anniversary Looking For Group browser.
 
 ![LFG Filter Panel](screenshot.png)
 
+### ElvUI Support
+
+![LFG Filter with ElvUI](screenshot_elvui.png)
+
 ## Features
 
 - **Find Players** - Filter solo players by class and/or role (for group leaders building a group)
 - **Find Groups** - Filter groups by open role slots: Tank, Healer, or DPS needed (for solo players looking for a group)
+- **Max Level (70) Only** - Filter to only show max level players (Find Players)
+- **Auto-refresh** - Automatically removes stale and delisted entries every 10 seconds
+- **ElvUI / TukUI support** - Automatically skins the panel when ElvUI or TukUI is installed
+- Native Blizzard dialog frame styling
 - Filters apply instantly on toggle
+- Filters persist through manual refresh
 - Filter preferences saved between sessions
-- Side panel anchored to the LFG window
+- Only shows on the Group Browser tab, not Create Listing
 
 ## Installation
 
