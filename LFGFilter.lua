@@ -103,6 +103,13 @@ local function AnyFilterActive()
     return AnyPlayerFilterActive() or AnyGroupFilterActive()
 end
 
+local function PlayerIsInGroup()
+    if _G.GetNumGroupMembers then
+        return _G.GetNumGroupMembers() > 0
+    end
+    return false
+end
+
 local function HexColor(hex)
     return tonumber(hex:sub(1, 2), 16) / 255,
            tonumber(hex:sub(3, 4), 16) / 255,
@@ -358,7 +365,8 @@ local function ApplyFilters()
             end
 
             -- Skip stale/delisted entries
-            if not info then
+            local hasInfo = C_LFGList.HasSearchResultInfo and C_LFGList.HasSearchResultInfo(rid)
+            if not info or not hasInfo then
                 -- Entry no longer valid
             elseif info.isDelisted then
                 -- Explicitly delisted
@@ -412,6 +420,13 @@ local function ApplyAndRefresh()
     ResetAutoRefreshTimer()
     if not lfgBrowseFrame or not lfgBrowseFrame:IsShown() then return end
     if isApplyingFilters then return end
+
+    -- When in a group, skip UpdateResultList (causes "Searching..." freeze)
+    -- but still re-filter the existing data
+    if PlayerIsInGroup() then
+        ApplyFilters()
+        return
+    end
 
     -- Refresh to get full unfiltered data from cache
     isApplyingFilters = true
@@ -817,7 +832,11 @@ local function CreateFilterPanel()
         autoRefreshElapsed = autoRefreshElapsed + elapsed
         if autoRefreshElapsed >= AUTO_REFRESH_INTERVAL then
             autoRefreshElapsed = 0
-            ApplyAndRefresh()
+            if PlayerIsInGroup() then
+                ApplyFilters()
+            else
+                ApplyAndRefresh()
+            end
         end
     end)
 
@@ -972,12 +991,17 @@ initFrame:SetScript("OnEvent", function(self, event, arg1)
                 initialized = true
                 RestoreFilterState()
 
-                -- Hook native refresh so filters persist when WoW updates the list
-                -- Uses ApplyFilters (not ApplyAndRefresh) to avoid calling UpdateResultList again
+                -- Hook native refresh so filters persist when WoW updates the list.
+                -- Debounced to avoid racing with rapid dungeon filter clicks.
+                local pendingFilterTimer = nil
                 if lfgBrowseFrame.UpdateResultList then
                     hooksecurefunc(lfgBrowseFrame, "UpdateResultList", function()
-                        if not isApplyingFilters and AnyFilterActive() then
-                            C_Timer.After(0, ApplyFilters)
+                        if not isApplyingFilters and AnyFilterActive() and not PlayerIsInGroup() then
+                            if pendingFilterTimer then pendingFilterTimer:Cancel() end
+                            pendingFilterTimer = C_Timer.NewTimer(0.3, function()
+                                pendingFilterTimer = nil
+                                ApplyFilters()
+                            end)
                         end
                     end)
                 end

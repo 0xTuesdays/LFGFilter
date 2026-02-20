@@ -1,4 +1,4 @@
-## Interface: 20504
+## Interface: 20505
 ## Title: LFG Filter
 ## Notes: Adds class and role filtering to the TBC Anniversary Looking For Group browser
 ## Author: Tuesdays
