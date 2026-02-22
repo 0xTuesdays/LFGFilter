@@ -76,9 +76,12 @@ local maxLevelButton
 local activeMaxLevel = false
 
 -- Auto-refresh state
-local AUTO_REFRESH_INTERVAL = 10  -- seconds
+local AUTO_REFRESH_INTERVAL = 30  -- seconds
 local autoRefreshElapsed = 0
 local isApplyingFilters = false
+
+-- Panel visibility state
+local panelManuallyHidden = false
 
 -- Track all skinnable frames for ElvUI/TukUI
 local skinnableButtons = {}
@@ -414,31 +417,122 @@ local function ApplyFilters()
     isApplyingFilters = false
 end
 
--- ApplyAndRefresh: refreshes the DataProvider from cached data, then filters.
--- Use this for manual filter toggles (instant feedback, no server call).
+-- ApplyAndRefresh: rebuilds and filters in one step from cached search results.
+-- Uses C_LFGList.GetSearchResults to avoid calling UpdateResultList which can
+-- trigger Blizzard's search state machinery and cause "Searching..." freezes.
+-- By combining rebuild + filter, we only ever set a single validated DataProvider
+-- on the ScrollBox, preventing Blizzard from rendering stale entries.
 local function ApplyAndRefresh()
     ResetAutoRefreshTimer()
     if not lfgBrowseFrame or not lfgBrowseFrame:IsShown() then return end
     if isApplyingFilters then return end
+    isApplyingFilters = true
 
-    -- When in a group, skip UpdateResultList (causes "Searching..." freeze)
-    -- but still re-filter the existing data
-    if PlayerIsInGroup() then
-        ApplyFilters()
+    if not lfgScrollBox then
+        lfgScrollBox = _G["LFGBrowseFrameScrollBox"]
+    end
+    if not lfgScrollBox then
+        isApplyingFilters = false
         return
     end
 
-    -- Refresh to get full unfiltered data from cache
-    isApplyingFilters = true
-    if lfgBrowseFrame.UpdateResultList then
-        lfgBrowseFrame:UpdateResultList()
-    elseif lfgBrowseFrame.UpdateResults then
-        lfgBrowseFrame:UpdateResults()
-    end
-    isApplyingFilters = false
+    SaveFilterState()
 
-    -- Now filter the refreshed data
-    ApplyFilters()
+    -- Get all cached result IDs from the API
+    local allResultIDs = nil
+    if C_LFGList and C_LFGList.GetSearchResults then
+        local ok, numResults, results = pcall(C_LFGList.GetSearchResults)
+        if ok and type(results) == "table" then
+            allResultIDs = results
+        end
+    end
+
+    -- Fall back to current DataProvider if GetSearchResults didn't work
+    if not allResultIDs then
+        local dp = lfgScrollBox.GetDataProvider and lfgScrollBox:GetDataProvider()
+        if dp and dp.Enumerate then
+            allResultIDs = {}
+            for _, entry in dp:Enumerate() do
+                if type(entry) == "table" and entry.resultID then
+                    table.insert(allResultIDs, entry.resultID)
+                end
+            end
+        end
+    end
+
+    if not allResultIDs then
+        isApplyingFilters = false
+        return
+    end
+
+    local findPlayers = AnyPlayerFilterActive()
+    local findGroups = AnyGroupFilterActive()
+    local filtersActive = AnyFilterActive()
+
+    local passingEntries = {}
+
+    for _, rid in ipairs(allResultIDs) do
+        -- Validate the entry still exists before including it
+        local hasInfo = C_LFGList.HasSearchResultInfo and C_LFGList.HasSearchResultInfo(rid)
+        if not hasInfo then
+            -- Skip stale entry
+        else
+            local info = nil
+            if C_LFGList.GetSearchResultInfo then
+                local ok, result = pcall(C_LFGList.GetSearchResultInfo, rid)
+                if ok and type(result) == "table" then info = result end
+            end
+
+            if not info or info.isDelisted then
+                -- Skip invalid/delisted entries
+            elseif not filtersActive then
+                -- No filters: include all valid entries
+                table.insert(passingEntries, { resultID = rid })
+            else
+                local counts = nil
+                if C_LFGList.GetSearchResultMemberCounts then
+                    local ok, result = pcall(C_LFGList.GetSearchResultMemberCounts, rid)
+                    if ok and type(result) == "table" then counts = result end
+                end
+
+                local entry = { resultID = rid }
+
+                if activeMaxLevel and not EntryPassesMaxLevel(entry, info) then
+                    -- Skip non-max-level entries
+                elseif findPlayers then
+                    if EntryPassesFindPlayers(entry, counts, info) then
+                        table.insert(passingEntries, entry)
+                    end
+                elseif findGroups then
+                    if EntryPassesFindGroups(entry, counts, info) then
+                        table.insert(passingEntries, entry)
+                    end
+                end
+            end
+        end
+    end
+
+    totalResultCount = #allResultIDs
+
+    local newDP = CreateDataProvider()
+    if newDP then
+        newDP:InsertTable(passingEntries)
+        lfgScrollBox:SetDataProvider(newDP)
+    end
+
+    if resultCountText then
+        if not filtersActive then
+            resultCountText:SetText("")
+        elseif findPlayers then
+            resultCountText:SetText(format("Showing %d players of %d listings", #passingEntries, totalResultCount))
+        elseif findGroups then
+            resultCountText:SetText(format("Showing %d groups of %d listings", #passingEntries, totalResultCount))
+        else
+            resultCountText:SetText(format("Showing %d of %d listings", #passingEntries, totalResultCount))
+        end
+    end
+
+    isApplyingFilters = false
 end
 
 
@@ -546,12 +640,15 @@ local function ClearAllFilters()
 
     SaveFilterState()
 
-    if lfgBrowseFrame then
+    -- Restore unfiltered list
+    if lfgBrowseFrame and not PlayerIsInGroup() then
+        isApplyingFilters = true
         if lfgBrowseFrame.UpdateResultList then
             lfgBrowseFrame:UpdateResultList()
         elseif lfgBrowseFrame.UpdateResults then
             lfgBrowseFrame:UpdateResults()
         end
+        isApplyingFilters = false
     end
 end
 
@@ -624,7 +721,7 @@ end
 local function CreateFilterPanel()
     if not lfgParent then return false end
 
-    local PANEL_WIDTH = 260
+    local PANEL_WIDTH = 310
     local PADDING = 14
     local INNER_WIDTH = PANEL_WIDTH - PADDING * 2
 
@@ -649,17 +746,52 @@ local function CreateFilterPanel()
     titleBg:SetPoint("TOP", 0, 12)
 
     -- Only show filter panel when the Browse tab is active, not Create Listing
-    lfgBrowseFrame:HookScript("OnShow", function() filterPanel:Show() end)
+    lfgBrowseFrame:HookScript("OnShow", function()
+        if not panelManuallyHidden then filterPanel:Show() end
+    end)
     lfgBrowseFrame:HookScript("OnHide", function() filterPanel:Hide() end)
     lfgParent:HookScript("OnHide", function() filterPanel:Hide() end)
     if not lfgBrowseFrame:IsShown() then filterPanel:Hide() end
+
+    -- Toggle button on the Blizzard LFG window (top-right of browse frame)
+    local toggleBtn = CreateFrame("Button", nil, lfgBrowseFrame)
+    toggleBtn:SetSize(24, 24)
+    toggleBtn:SetPoint("RIGHT", lfgBrowseFrame, "TOPRIGHT", -58, -60)
+    toggleBtn:SetFrameStrata("DIALOG")
+
+    toggleBtn:SetNormalTexture("Interface\\AddOns\\LFGFilter\\LFG_Filter_Icon_24x24")
+    toggleBtn:SetPushedTexture("Interface\\AddOns\\LFGFilter\\LFG_Filter_Icon_24x24")
+    local pushed = toggleBtn:GetPushedTexture()
+    if pushed then pushed:SetVertexColor(0.8, 0.8, 0.8) end
+    toggleBtn:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
+
+    toggleBtn:SetScript("OnClick", function()
+        if filterPanel:IsShown() then
+            panelManuallyHidden = true
+            filterPanel:Hide()
+        else
+            panelManuallyHidden = false
+            filterPanel:Show()
+        end
+    end)
+
+    toggleBtn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+        GameTooltip:SetText("LFG Filter")
+        GameTooltip:AddLine("Click to toggle filter panel", 0.7, 0.7, 0.7)
+        GameTooltip:Show()
+    end)
+    toggleBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     local yPos = -8
 
     -- Close button (X) - standard Blizzard close button
     local closeBtn = CreateFrame("Button", nil, filterPanel, "UIPanelCloseButton")
     closeBtn:SetPoint("TOPRIGHT", -6, -6)
-    closeBtn:SetScript("OnClick", function() filterPanel:Hide() end)
+    closeBtn:SetScript("OnClick", function()
+        panelManuallyHidden = true
+        filterPanel:Hide()
+    end)
     skinnableCloseBtn = closeBtn
 
     -- Title (sits inside the header texture with proper padding)
@@ -728,9 +860,9 @@ local function CreateFilterPanel()
     classLabel:SetTextColor(0.8, 0.8, 0.8)
     yPos = yPos - 18
 
-    local COLS = 2
-    local COL_GAP = 6
-    local CLASS_BTN_W = (INNER_WIDTH - COL_GAP) / COLS
+    local COLS = 3
+    local COL_GAP = 4
+    local CLASS_BTN_W = (INNER_WIDTH - COL_GAP * (COLS - 1)) / COLS
     local CLASS_BTN_H = 24
     local CLASS_ROW_H = CLASS_BTN_H + 4
 
@@ -817,11 +949,19 @@ local function CreateFilterPanel()
     clearBtn.isUIPanelButton = true
     table.insert(skinnableButtons, clearBtn)
 
+    -- Credit line
+    local creditLabel = filterPanel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    creditLabel:SetPoint("TOPLEFT", PADDING, yPos - 28 - 4)
+    creditLabel:SetPoint("RIGHT", filterPanel, "RIGHT", -PADDING, 0)
+    creditLabel:SetText("Made by Tuesdays-Dreamscythe")
+    creditLabel:SetTextColor(0.5, 0.5, 0.5)
+    creditLabel:SetJustifyH("CENTER")
+
     -- Set panel height based on content
-    local contentBottom = -yPos + 28 + 16  -- account for clear button height + bottom padding
+    local contentBottom = -yPos + 28 + 4 + 14 + 12  -- clear button + credit line + bottom padding
     filterPanel:SetHeight(contentBottom)
 
-    -- Auto-refresh every 10 seconds: re-filter cached data to remove delisted entries.
+    -- Auto-refresh every 30 seconds: re-filter cached data to remove delisted entries.
     -- New listings appear when the user clicks Refresh or when the server pushes updates
     -- (we listen for LFG_LIST_SEARCH_RESULTS_RECEIVED to re-apply filters automatically).
     filterPanel:SetScript("OnUpdate", function(self, elapsed)
@@ -939,9 +1079,15 @@ SlashCmdList["LFGFILTER"] = function(msg)
     if msg == "reset" then
         ClearAllFilters()
     elseif msg == "hide" then
-        if filterPanel then filterPanel:Hide() end
+        if filterPanel then
+            panelManuallyHidden = true
+            filterPanel:Hide()
+        end
     elseif msg == "show" then
-        if filterPanel then filterPanel:Show() end
+        if filterPanel then
+            panelManuallyHidden = false
+            filterPanel:Show()
+        end
     elseif msg == "debug" then
         DumpFrameInfo()
     else
@@ -961,7 +1107,6 @@ initFrame:RegisterEvent("ADDON_LOADED")
 initFrame:RegisterEvent("LFG_UPDATE")
 initFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 initFrame:RegisterEvent("LFG_LIST_SEARCH_RESULTS_RECEIVED")
-initFrame:RegisterEvent("LFG_LIST_SEARCH_RESULT_UPDATED")
 
 local initialized = false
 
@@ -971,11 +1116,11 @@ initFrame:SetScript("OnEvent", function(self, event, arg1)
         print("|cff00ff00[LFG Filter]|r loaded. Type /lfgf for commands.")
     end
 
-    -- Re-apply filters whenever new search results arrive (manual refresh, server push, etc.)
-    if event == "LFG_LIST_SEARCH_RESULTS_RECEIVED" or event == "LFG_LIST_SEARCH_RESULT_UPDATED" then
+    -- Re-apply filters after a manual refresh (full search results received)
+    if event == "LFG_LIST_SEARCH_RESULTS_RECEIVED" then
         if initialized and AnyFilterActive() and lfgBrowseFrame and lfgBrowseFrame:IsShown() then
             -- Let the native UI update first, then re-apply our filters
-            C_Timer.After(0.1, function()
+            C_Timer.After(0.5, function()
                 ApplyAndRefresh()
             end)
         end
@@ -990,21 +1135,6 @@ initFrame:SetScript("OnEvent", function(self, event, arg1)
             if CreateFilterPanel() then
                 initialized = true
                 RestoreFilterState()
-
-                -- Hook native refresh so filters persist when WoW updates the list.
-                -- Debounced to avoid racing with rapid dungeon filter clicks.
-                local pendingFilterTimer = nil
-                if lfgBrowseFrame.UpdateResultList then
-                    hooksecurefunc(lfgBrowseFrame, "UpdateResultList", function()
-                        if not isApplyingFilters and AnyFilterActive() and not PlayerIsInGroup() then
-                            if pendingFilterTimer then pendingFilterTimer:Cancel() end
-                            pendingFilterTimer = C_Timer.NewTimer(0.3, function()
-                                pendingFilterTimer = nil
-                                ApplyFilters()
-                            end)
-                        end
-                    end)
-                end
 
                 -- Apply ElvUI/TukUI skin after a short delay to ensure UI addons are ready
                 C_Timer.After(1, TrySkinPanel)

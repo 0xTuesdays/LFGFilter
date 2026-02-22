@@ -22,12 +22,12 @@ jobs:
       - name: Package addon
         run: |
           mkdir -p LFGFilter
-          cp LFGFilter.toc LFGFilter.lua LFGFilter/
+          cp LFGFilter.toc LFGFilter.lua LFG_Filter_Icon_24x24.tga LFGFilter/
           zip -r LFGFilter-${{ steps.version.outputs.version }}.zip LFGFilter/
 
       - name: Create release.json for WoWUp
         run: |
-          echo '{"releases":[{"filename":"LFGFilter-${{ steps.version.outputs.version }}.zip","nolib":false,"metadata":[{"flavor":"bcc","interface":20504}]}]}' > release.json
+          echo '{"releases":[{"filename":"LFGFilter-${{ steps.version.outputs.version }}.zip","nolib":false,"metadata":[{"flavor":"bcc","interface":20505}]}]}' > release.json
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
