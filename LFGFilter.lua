@@ -360,6 +360,7 @@ local function ApplyFilters()
 
     local allEntries = {}
     local passingEntries = {}
+    local validEntryCount = 0
 
     for idx, entry in dp:Enumerate() do
         table.insert(allEntries, entry)
@@ -380,6 +381,7 @@ local function ApplyFilters()
             elseif info.isDelisted then
                 -- Explicitly delisted
             else
+                validEntryCount = validEntryCount + 1
                 local counts = nil
                 if C_LFGList and C_LFGList.GetSearchResultMemberCounts then
                     local ok, result = pcall(C_LFGList.GetSearchResultMemberCounts, rid)
@@ -404,9 +406,10 @@ local function ApplyFilters()
 
     totalResultCount = #allEntries
 
-    -- Safety: never replace a populated list with an empty one.
-    -- This prevents the "Searching..." freeze when all entries become stale.
-    if #passingEntries == 0 and totalResultCount > 0 then
+    -- Safety: only bail out if ALL entries were stale/invalid (no valid entries found).
+    -- This prevents the "Searching..." freeze when data is completely stale,
+    -- while still allowing legitimate "no matches" when filters are active.
+    if #passingEntries == 0 and validEntryCount == 0 and totalResultCount > 0 then
         isApplyingFilters = false
         return
     end
@@ -483,6 +486,7 @@ local function ApplyAndRefresh()
     local filtersActive = AnyFilterActive()
 
     local passingEntries = {}
+    local validEntryCount = 0
 
     for _, rid in ipairs(allResultIDs) do
         -- Validate the entry still exists before including it
@@ -500,8 +504,10 @@ local function ApplyAndRefresh()
                 -- Skip invalid/delisted entries
             elseif not filtersActive then
                 -- No filters: include all valid entries
+                validEntryCount = validEntryCount + 1
                 table.insert(passingEntries, { resultID = rid })
             else
+                validEntryCount = validEntryCount + 1
                 local counts = nil
                 if C_LFGList.GetSearchResultMemberCounts then
                     local ok, result = pcall(C_LFGList.GetSearchResultMemberCounts, rid)
@@ -527,20 +533,12 @@ local function ApplyAndRefresh()
 
     totalResultCount = #allResultIDs
 
-    -- Safety: never replace a populated list with an empty one.
-    -- This prevents the "Searching..." freeze when API returns stale/empty data.
-    if #passingEntries == 0 and totalResultCount == 0 then
-        local existingDP = lfgScrollBox.GetDataProvider and lfgScrollBox:GetDataProvider()
-        if existingDP then
-            local existingCount = 0
-            if existingDP.Enumerate then
-                for _ in existingDP:Enumerate() do existingCount = existingCount + 1 end
-            end
-            if existingCount > 0 then
-                isApplyingFilters = false
-                return
-            end
-        end
+    -- Safety: only bail out if ALL entries were stale/invalid (no valid entries found).
+    -- This prevents the "Searching..." freeze when data is completely stale,
+    -- while still allowing legitimate "no matches" when filters are active.
+    if #passingEntries == 0 and validEntryCount == 0 and totalResultCount > 0 then
+        isApplyingFilters = false
+        return
     end
 
     local newDP = CreateDataProvider()
