@@ -1,9 +1,9 @@
 ----------------------------------------------------------------------
--- LFG Filter v1.1 - TBC Anniversary Looking For Group Browser Filter
+-- LFG Filter v1.2 - TBC Anniversary Looking For Group Browser Filter
 -- Two filter modes:
 --   "Find Players" - Shows solo players matching class/role/level filters
 --   "Find Groups"  - Shows groups with available role slots
--- Auto-refresh removes stale/delisted entries every 10 seconds.
+-- Auto-refresh removes stale/delisted entries every 30 seconds.
 -- Filters auto-apply on toggle. Preferences saved between sessions.
 -- Supports ElvUI and TukUI skinning when available.
 ----------------------------------------------------------------------
@@ -139,6 +139,7 @@ local function SaveFilterState()
     end
 
     LFGFilterDB.maxLevel = activeMaxLevel or nil
+    LFGFilterDB.panelHidden = panelManuallyHidden or nil
 end
 
 local function RestoreFilterState()
@@ -180,6 +181,11 @@ local function RestoreFilterState()
             maxLevelButton.isActive = true
             maxLevelButton:UpdateVisual()
         end
+    end
+
+    if LFGFilterDB.panelHidden then
+        panelManuallyHidden = true
+        if filterPanel then filterPanel:Hide() end
     end
 end
 
@@ -398,6 +404,13 @@ local function ApplyFilters()
 
     totalResultCount = #allEntries
 
+    -- Safety: never replace a populated list with an empty one.
+    -- This prevents the "Searching..." freeze when all entries become stale.
+    if #passingEntries == 0 and totalResultCount > 0 then
+        isApplyingFilters = false
+        return
+    end
+
     local newDP = CreateDataProvider()
     if newDP then
         newDP:InsertTable(passingEntries)
@@ -513,6 +526,22 @@ local function ApplyAndRefresh()
     end
 
     totalResultCount = #allResultIDs
+
+    -- Safety: never replace a populated list with an empty one.
+    -- This prevents the "Searching..." freeze when API returns stale/empty data.
+    if #passingEntries == 0 and totalResultCount == 0 then
+        local existingDP = lfgScrollBox.GetDataProvider and lfgScrollBox:GetDataProvider()
+        if existingDP then
+            local existingCount = 0
+            if existingDP.Enumerate then
+                for _ in existingDP:Enumerate() do existingCount = existingCount + 1 end
+            end
+            if existingCount > 0 then
+                isApplyingFilters = false
+                return
+            end
+        end
+    end
 
     local newDP = CreateDataProvider()
     if newDP then
@@ -641,14 +670,20 @@ local function ClearAllFilters()
     SaveFilterState()
 
     -- Restore unfiltered list
-    if lfgBrowseFrame and not PlayerIsInGroup() then
-        isApplyingFilters = true
-        if lfgBrowseFrame.UpdateResultList then
-            lfgBrowseFrame:UpdateResultList()
-        elseif lfgBrowseFrame.UpdateResults then
-            lfgBrowseFrame:UpdateResults()
+    if lfgBrowseFrame then
+        if not PlayerIsInGroup() then
+            -- Solo: safe to call native refresh
+            isApplyingFilters = true
+            if lfgBrowseFrame.UpdateResultList then
+                lfgBrowseFrame:UpdateResultList()
+            elseif lfgBrowseFrame.UpdateResults then
+                lfgBrowseFrame:UpdateResults()
+            end
+            isApplyingFilters = false
+        else
+            -- In group: rebuild from cache (no filters active, so shows everything)
+            ApplyAndRefresh()
         end
-        isApplyingFilters = false
     end
 end
 
@@ -1121,7 +1156,11 @@ initFrame:SetScript("OnEvent", function(self, event, arg1)
         if initialized and AnyFilterActive() and lfgBrowseFrame and lfgBrowseFrame:IsShown() then
             -- Let the native UI update first, then re-apply our filters
             C_Timer.After(0.5, function()
-                ApplyAndRefresh()
+                if PlayerIsInGroup() then
+                    ApplyFilters()
+                else
+                    ApplyAndRefresh()
+                end
             end)
         end
         return
