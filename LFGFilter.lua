@@ -1,8 +1,10 @@
 ----------------------------------------------------------------------
--- LFG Filter v1.2 - TBC Anniversary Looking For Group Browser Filter
+-- LFG Filter v1.3.0 - TBC Anniversary Looking For Group Browser Filter
 -- Two filter modes:
 --   "Find Players" - Shows solo players matching class/role/level filters
 --   "Find Groups"  - Shows groups with available role slots
+-- Friend/guild priority: entries with BNet friends, character friends,
+--   or guild members are highlighted green and sorted to the top.
 -- Auto-refresh removes stale/delisted entries every 30 seconds.
 -- Filters auto-apply on toggle. Preferences saved between sessions.
 -- Supports ElvUI and TukUI skinning when available.
@@ -117,6 +119,28 @@ local function HexColor(hex)
     return tonumber(hex:sub(1, 2), 16) / 255,
            tonumber(hex:sub(3, 4), 16) / 255,
            tonumber(hex:sub(5, 6), 16) / 255
+end
+
+local function HasSocialMembers(resultID)
+    local ok, info = pcall(C_LFGList.GetSearchResultInfo, resultID)
+    if ok and type(info) == "table" then
+        return (info.numBNetFriends or 0) + (info.numCharFriends or 0) + (info.numGuildMates or 0) > 0
+    end
+    return false
+end
+
+local function SortSocialFirst(entries)
+    -- Pre-compute social status to avoid repeated API calls during sort
+    local socialCache = {}
+    for _, entry in ipairs(entries) do
+        socialCache[entry.resultID] = HasSocialMembers(entry.resultID)
+    end
+    table.sort(entries, function(a, b)
+        local aSocial = socialCache[a.resultID]
+        local bSocial = socialCache[b.resultID]
+        if aSocial ~= bSocial then return aSocial end
+        return false
+    end)
 end
 
 ----------------------------------------------------------------------
@@ -343,18 +367,13 @@ local function ApplyFilters()
 
     SaveFilterState()
 
-    if not AnyFilterActive() then
-        if resultCountText then resultCountText:SetText("") end
-        isApplyingFilters = false
-        return
-    end
-
     local dp = lfgScrollBox.GetDataProvider and lfgScrollBox:GetDataProvider()
     if not dp or not dp.Enumerate then
         isApplyingFilters = false
         return
     end
 
+    local filtersActive = AnyFilterActive()
     local findPlayers = AnyPlayerFilterActive()
     local findGroups = AnyGroupFilterActive()
 
@@ -380,6 +399,10 @@ local function ApplyFilters()
                 -- Entry no longer valid
             elseif info.isDelisted then
                 -- Explicitly delisted
+            elseif not filtersActive then
+                -- No filters: include all valid entries (still need social sort)
+                validEntryCount = validEntryCount + 1
+                table.insert(passingEntries, entry)
             else
                 validEntryCount = validEntryCount + 1
                 local counts = nil
@@ -407,21 +430,36 @@ local function ApplyFilters()
     totalResultCount = #allEntries
 
     -- Safety: only bail out if ALL entries were stale/invalid (no valid entries found).
-    -- This prevents the "Searching..." freeze when data is completely stale,
-    -- while still allowing legitimate "no matches" when filters are active.
     if #passingEntries == 0 and validEntryCount == 0 and totalResultCount > 0 then
         isApplyingFilters = false
         return
     end
 
-    local newDP = CreateDataProvider()
-    if newDP then
-        newDP:InsertTable(passingEntries)
-        lfgScrollBox:SetDataProvider(newDP)
+    -- Check if any entries have social connections (friends/guild)
+    local hasSocialEntries = false
+    for _, entry in ipairs(passingEntries) do
+        if HasSocialMembers(entry.resultID) then
+            hasSocialEntries = true
+            break
+        end
+    end
+
+    -- Only replace DataProvider if we need to (filters active or social sort needed).
+    -- Unnecessary replacements can cause Blizzard UI errors with stale entries.
+    if filtersActive or hasSocialEntries then
+        SortSocialFirst(passingEntries)
+
+        local newDP = CreateDataProvider()
+        if newDP then
+            newDP:InsertTable(passingEntries)
+            lfgScrollBox:SetDataProvider(newDP)
+        end
     end
 
     if resultCountText then
-        if findPlayers then
+        if not filtersActive then
+            resultCountText:SetText("")
+        elseif findPlayers then
             resultCountText:SetText(format("Showing %d players of %d listings", #passingEntries, totalResultCount))
         elseif findGroups then
             resultCountText:SetText(format("Showing %d groups of %d listings", #passingEntries, totalResultCount))
@@ -541,6 +579,9 @@ local function ApplyAndRefresh()
         return
     end
 
+    -- Sort friend/guild entries to the top
+    SortSocialFirst(passingEntries)
+
     local newDP = CreateDataProvider()
     if newDP then
         newDP:InsertTable(passingEntries)
@@ -561,8 +602,6 @@ local function ApplyAndRefresh()
 
     isApplyingFilters = false
 end
-
-
 
 ----------------------------------------------------------------------
 -- UI HELPERS
@@ -994,11 +1033,11 @@ local function CreateFilterPanel()
     local contentBottom = -yPos + 28 + 4 + 14 + 12  -- clear button + credit line + bottom padding
     filterPanel:SetHeight(contentBottom)
 
-    -- Auto-refresh every 30 seconds: re-filter cached data to remove delisted entries.
-    -- New listings appear when the user clicks Refresh or when the server pushes updates
-    -- (we listen for LFG_LIST_SEARCH_RESULTS_RECEIVED to re-apply filters automatically).
+    -- Auto-refresh every 30 seconds: re-filter cached data to remove delisted entries
+    -- and maintain social sorting. Runs whenever filters are active or the browse frame
+    -- is shown (to keep social sort and stale entry cleanup working).
     filterPanel:SetScript("OnUpdate", function(self, elapsed)
-        if not AnyFilterActive() then
+        if not lfgBrowseFrame or not lfgBrowseFrame:IsShown() then
             autoRefreshElapsed = 0
             return
         end
@@ -1099,7 +1138,27 @@ local function DumpFrameInfo()
     -- Frame status
     print("  --- Status ---")
     print(format("    Browse frame: %s", lfgBrowseFrame and "found" or "NOT FOUND"))
-    print(format("    Auto-refresh: %s", AnyFilterActive() and "active" or "idle"))
+    print(format("    Auto-refresh: %s", (lfgBrowseFrame and lfgBrowseFrame:IsShown()) and "active" or "idle"))
+
+    -- Social/friend info per entry
+    print("  --- Friend/Guild Info ---")
+    if dp and dp.Enumerate then
+        for _, entry in dp:Enumerate() do
+            if type(entry) == "table" and entry.resultID then
+                local ok, info = pcall(C_LFGList.GetSearchResultInfo, entry.resultID)
+                if ok and type(info) == "table" then
+                    local bnet = info.numBNetFriends or 0
+                    local chars = info.numCharFriends or 0
+                    local guild = info.numGuildMates or 0
+                    local social = bnet + chars + guild > 0
+                    print(format("  rid=%d leader=%s: BNet=%d Char=%d Guild=%d %s",
+                        entry.resultID, tostring(info.leaderName),
+                        bnet, chars, guild,
+                        social and "|cff00ff00HIGHLIGHTED|r" or ""))
+                end
+            end
+        end
+    end
 end
 
 ----------------------------------------------------------------------
@@ -1149,14 +1208,16 @@ initFrame:SetScript("OnEvent", function(self, event, arg1)
         print("|cff00ff00[LFG Filter]|r loaded. Type /lfgf for commands.")
     end
 
-    -- Re-apply filters after a manual refresh (full search results received)
+    -- Re-apply filters and social sorting after search results update
     if event == "LFG_LIST_SEARCH_RESULTS_RECEIVED" then
-        if initialized and AnyFilterActive() and lfgBrowseFrame and lfgBrowseFrame:IsShown() then
-            -- Let the native UI update first, then re-apply our filters
+        if initialized and lfgBrowseFrame and lfgBrowseFrame:IsShown() then
+            -- Let the native UI update first, then re-apply our filters/sorting
             C_Timer.After(0.5, function()
                 if PlayerIsInGroup() then
+                    -- In group: only filter existing DataProvider (safe, no rebuild)
                     ApplyFilters()
                 else
+                    -- Solo: full rebuild + filter + social sort
                     ApplyAndRefresh()
                 end
             end)
@@ -1175,6 +1236,39 @@ initFrame:SetScript("OnEvent", function(self, event, arg1)
 
                 -- Apply ElvUI/TukUI skin after a short delay to ensure UI addons are ready
                 C_Timer.After(1, TrySkinPanel)
+
+                -- Hook LFG browse entry rendering to highlight friend/guild entries
+                if _G.LFGBrowseSearchEntry_Update then
+                    hooksecurefunc("LFGBrowseSearchEntry_Update", function(button)
+                        local resultID = button and button.resultID
+                        if not resultID then
+                            local data = button and button.GetElementData and button:GetElementData()
+                            if data and type(data) == "table" then
+                                resultID = data.resultID
+                            end
+                        end
+                        if not resultID then return end
+
+                        -- Create highlight textures once per button frame
+                        if not button.lfgFilterSocialHighlight then
+                            local highlight = button:CreateTexture(nil, "BACKGROUND", nil, 1)
+                            highlight:SetAllPoints()
+                            highlight:SetColorTexture(0.1, 0.8, 0.1, 0.15)
+                            button.lfgFilterSocialHighlight = highlight
+
+                            local icon = button:CreateTexture(nil, "OVERLAY")
+                            icon:SetSize(20, 20)
+                            icon:SetPoint("RIGHT", button, "RIGHT", -1, 0)
+                            icon:SetTexture("Interface\\FriendsFrame\\UI-Toast-FriendOnlineIcon")
+                            button.lfgFilterSocialIcon = icon
+                        end
+
+                        local hasSocial = HasSocialMembers(resultID)
+                        button.lfgFilterSocialHighlight:SetShown(hasSocial)
+                        button.lfgFilterSocialIcon:SetShown(hasSocial)
+                    end)
+                end
+
             end
         end
     end
