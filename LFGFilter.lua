@@ -1,5 +1,5 @@
 ----------------------------------------------------------------------
--- LFG Filter v1.3.0 - TBC Anniversary Looking For Group Browser Filter
+-- LFG Filter v1.3.1 - TBC Anniversary Looking For Group Browser Filter
 -- Two filter modes:
 --   "Find Players" - Shows solo players matching class/role/level filters
 --   "Find Groups"  - Shows groups with available role slots
@@ -1033,11 +1033,10 @@ local function CreateFilterPanel()
     local contentBottom = -yPos + 28 + 4 + 14 + 12  -- clear button + credit line + bottom padding
     filterPanel:SetHeight(contentBottom)
 
-    -- Auto-refresh every 30 seconds: re-filter cached data to remove delisted entries
-    -- and maintain social sorting. Runs whenever filters are active or the browse frame
-    -- is shown (to keep social sort and stale entry cleanup working).
+    -- Auto-refresh every 30 seconds: re-filter cached data to remove delisted entries.
+    -- Only runs when filters are active to avoid interfering with Blizzard's search state.
     filterPanel:SetScript("OnUpdate", function(self, elapsed)
-        if not lfgBrowseFrame or not lfgBrowseFrame:IsShown() then
+        if not AnyFilterActive() then
             autoRefreshElapsed = 0
             return
         end
@@ -1138,7 +1137,7 @@ local function DumpFrameInfo()
     -- Frame status
     print("  --- Status ---")
     print(format("    Browse frame: %s", lfgBrowseFrame and "found" or "NOT FOUND"))
-    print(format("    Auto-refresh: %s", (lfgBrowseFrame and lfgBrowseFrame:IsShown()) and "active" or "idle"))
+    print(format("    Auto-refresh: %s", AnyFilterActive() and "active" or "idle"))
 
     -- Social/friend info per entry
     print("  --- Friend/Guild Info ---")
@@ -1208,16 +1207,13 @@ initFrame:SetScript("OnEvent", function(self, event, arg1)
         print("|cff00ff00[LFG Filter]|r loaded. Type /lfgf for commands.")
     end
 
-    -- Re-apply filters and social sorting after search results update
+    -- Re-apply filters after search results update (only when filters are active)
     if event == "LFG_LIST_SEARCH_RESULTS_RECEIVED" then
-        if initialized and lfgBrowseFrame and lfgBrowseFrame:IsShown() then
-            -- Let the native UI update first, then re-apply our filters/sorting
+        if initialized and AnyFilterActive() and lfgBrowseFrame and lfgBrowseFrame:IsShown() then
             C_Timer.After(0.5, function()
                 if PlayerIsInGroup() then
-                    -- In group: only filter existing DataProvider (safe, no rebuild)
                     ApplyFilters()
                 else
-                    -- Solo: full rebuild + filter + social sort
                     ApplyAndRefresh()
                 end
             end)
