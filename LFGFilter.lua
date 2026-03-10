@@ -1,10 +1,11 @@
 ----------------------------------------------------------------------
--- LFG Filter v1.3.1 - TBC Anniversary Looking For Group Browser Filter
+-- LFG Filter v1.4.0 - TBC Anniversary Looking For Group Browser Filter
 -- Two filter modes:
 --   "Find Players" - Shows solo players matching class/role/level filters
 --   "Find Groups"  - Shows groups with available role slots
--- Friend/guild priority: entries with BNet friends, character friends,
---   or guild members are highlighted green and sorted to the top.
+-- General filters: boss progress (Fresh/Partial).
+-- Sort order: friend/guild entries first (highlighted green), then groups,
+--   then solo players.
 -- Auto-refresh removes stale/delisted entries every 30 seconds.
 -- Filters auto-apply on toggle. Preferences saved between sessions.
 -- Supports ElvUI and TukUI skinning when available.
@@ -77,6 +78,10 @@ local activeGroupRoles = {}
 local maxLevelButton
 local activeMaxLevel = false
 
+-- Boss progress filter state ("all", "fresh", "partial")
+local bossProgressMode = "all"
+local bossProgressButtons = {}
+
 -- Auto-refresh state
 local AUTO_REFRESH_INTERVAL = 30  -- seconds
 local autoRefreshElapsed = 0
@@ -104,8 +109,13 @@ local function AnyGroupFilterActive()
     return false
 end
 
+local function AnyGeneralFilterActive()
+    if bossProgressMode ~= "all" then return true end
+    return false
+end
+
 local function AnyFilterActive()
-    return AnyPlayerFilterActive() or AnyGroupFilterActive()
+    return AnyPlayerFilterActive() or AnyGroupFilterActive() or AnyGeneralFilterActive()
 end
 
 local function PlayerIsInGroup()
@@ -129,16 +139,23 @@ local function HasSocialMembers(resultID)
     return false
 end
 
-local function SortSocialFirst(entries)
-    -- Pre-compute social status to avoid repeated API calls during sort
+local function SortEntries(entries)
+    -- Pre-compute social status and group size to avoid repeated API calls
     local socialCache = {}
+    local groupCache = {}  -- true = group (2+ members), false = solo
     for _, entry in ipairs(entries) do
         socialCache[entry.resultID] = HasSocialMembers(entry.resultID)
+        local ok, info = pcall(C_LFGList.GetSearchResultInfo, entry.resultID)
+        groupCache[entry.resultID] = ok and type(info) == "table" and (info.numMembers or 0) >= 2
     end
+    -- Sort order: social first, then groups, then solo players
     table.sort(entries, function(a, b)
         local aSocial = socialCache[a.resultID]
         local bSocial = socialCache[b.resultID]
         if aSocial ~= bSocial then return aSocial end
+        local aGroup = groupCache[a.resultID]
+        local bGroup = groupCache[b.resultID]
+        if aGroup ~= bGroup then return aGroup end
         return false
     end)
 end
@@ -164,6 +181,7 @@ local function SaveFilterState()
 
     LFGFilterDB.maxLevel = activeMaxLevel or nil
     LFGFilterDB.panelHidden = panelManuallyHidden or nil
+    LFGFilterDB.bossProgress = bossProgressMode ~= "all" and bossProgressMode or nil
 end
 
 local function RestoreFilterState()
@@ -204,6 +222,14 @@ local function RestoreFilterState()
         if maxLevelButton then
             maxLevelButton.isActive = true
             maxLevelButton:UpdateVisual()
+        end
+    end
+
+    if LFGFilterDB.bossProgress and (LFGFilterDB.bossProgress == "fresh" or LFGFilterDB.bossProgress == "partial") then
+        bossProgressMode = LFGFilterDB.bossProgress
+        for mode, btn in pairs(bossProgressButtons) do
+            btn.isActive = (mode == bossProgressMode)
+            btn:UpdateVisual()
         end
     end
 
@@ -344,6 +370,22 @@ local function EntryPassesFindGroups(entry, counts, info)
 end
 
 ----------------------------------------------------------------------
+-- CORE: Check if entry passes boss progress filter
+----------------------------------------------------------------------
+local function EntryPassesBossProgress(resultID, mode)
+    if mode == "all" then return true end
+    if C_LFGList.GetSearchResultEncounterInfo then
+        local ok, encounters = pcall(C_LFGList.GetSearchResultEncounterInfo, resultID)
+        if ok then
+            local hasBossKills = type(encounters) == "table" and #encounters > 0
+            if mode == "fresh" then return not hasBossKills end
+            if mode == "partial" then return hasBossKills end
+        end
+    end
+    return true
+end
+
+----------------------------------------------------------------------
 -- CORE: Apply filters
 ----------------------------------------------------------------------
 local function ResetAutoRefreshTimer()
@@ -405,21 +447,30 @@ local function ApplyFilters()
                 table.insert(passingEntries, entry)
             else
                 validEntryCount = validEntryCount + 1
-                local counts = nil
-                if C_LFGList and C_LFGList.GetSearchResultMemberCounts then
-                    local ok, result = pcall(C_LFGList.GetSearchResultMemberCounts, rid)
-                    if ok and type(result) == "table" then counts = result end
-                end
 
-                -- Max level filter (Find Players only)
-                if activeMaxLevel and not EntryPassesMaxLevel(entry, info) then
-                    -- Skip non-max-level entries
-                elseif findPlayers then
-                    if EntryPassesFindPlayers(entry, counts, info) then
-                        table.insert(passingEntries, entry)
+                -- General filters (apply to all entries regardless of mode)
+                if not EntryPassesBossProgress(rid, bossProgressMode) then
+                    -- Skip: doesn't match boss progress filter
+                else
+                    local counts = nil
+                    if C_LFGList and C_LFGList.GetSearchResultMemberCounts then
+                        local ok, result = pcall(C_LFGList.GetSearchResultMemberCounts, rid)
+                        if ok and type(result) == "table" then counts = result end
                     end
-                elseif findGroups then
-                    if EntryPassesFindGroups(entry, counts, info) then
+
+                    -- Max level filter (Find Players only)
+                    if activeMaxLevel and not EntryPassesMaxLevel(entry, info) then
+                        -- Skip non-max-level entries
+                    elseif findPlayers then
+                        if EntryPassesFindPlayers(entry, counts, info) then
+                            table.insert(passingEntries, entry)
+                        end
+                    elseif findGroups then
+                        if EntryPassesFindGroups(entry, counts, info) then
+                            table.insert(passingEntries, entry)
+                        end
+                    else
+                        -- Only general filters active, no player/group mode
                         table.insert(passingEntries, entry)
                     end
                 end
@@ -435,19 +486,30 @@ local function ApplyFilters()
         return
     end
 
-    -- Check if any entries have social connections (friends/guild)
-    local hasSocialEntries = false
+    -- Check if any entries need reordering (social members or mixed groups/solo)
+    local needsSort = false
     for _, entry in ipairs(passingEntries) do
         if HasSocialMembers(entry.resultID) then
-            hasSocialEntries = true
+            needsSort = true
             break
         end
     end
+    if not needsSort and #passingEntries > 1 then
+        -- Check for mixed groups + solo players that need sorting
+        local hasGroup, hasSolo = false, false
+        for _, entry in ipairs(passingEntries) do
+            local ok, info = pcall(C_LFGList.GetSearchResultInfo, entry.resultID)
+            if ok and type(info) == "table" then
+                if (info.numMembers or 0) >= 2 then hasGroup = true else hasSolo = true end
+                if hasGroup and hasSolo then needsSort = true; break end
+            end
+        end
+    end
 
-    -- Only replace DataProvider if we need to (filters active or social sort needed).
+    -- Only replace DataProvider if we need to (filters active or sort needed).
     -- Unnecessary replacements can cause Blizzard UI errors with stale entries.
-    if filtersActive or hasSocialEntries then
-        SortSocialFirst(passingEntries)
+    if filtersActive or needsSort then
+        SortEntries(passingEntries)
 
         local newDP = CreateDataProvider()
         if newDP then
@@ -546,22 +608,31 @@ local function ApplyAndRefresh()
                 table.insert(passingEntries, { resultID = rid })
             else
                 validEntryCount = validEntryCount + 1
-                local counts = nil
-                if C_LFGList.GetSearchResultMemberCounts then
-                    local ok, result = pcall(C_LFGList.GetSearchResultMemberCounts, rid)
-                    if ok and type(result) == "table" then counts = result end
-                end
 
-                local entry = { resultID = rid }
-
-                if activeMaxLevel and not EntryPassesMaxLevel(entry, info) then
-                    -- Skip non-max-level entries
-                elseif findPlayers then
-                    if EntryPassesFindPlayers(entry, counts, info) then
-                        table.insert(passingEntries, entry)
+                -- General filters (apply to all entries regardless of mode)
+                if not EntryPassesBossProgress(rid, bossProgressMode) then
+                    -- Skip: doesn't match boss progress filter
+                else
+                    local counts = nil
+                    if C_LFGList.GetSearchResultMemberCounts then
+                        local ok, result = pcall(C_LFGList.GetSearchResultMemberCounts, rid)
+                        if ok and type(result) == "table" then counts = result end
                     end
-                elseif findGroups then
-                    if EntryPassesFindGroups(entry, counts, info) then
+
+                    local entry = { resultID = rid }
+
+                    if activeMaxLevel and not EntryPassesMaxLevel(entry, info) then
+                        -- Skip non-max-level entries
+                    elseif findPlayers then
+                        if EntryPassesFindPlayers(entry, counts, info) then
+                            table.insert(passingEntries, entry)
+                        end
+                    elseif findGroups then
+                        if EntryPassesFindGroups(entry, counts, info) then
+                            table.insert(passingEntries, entry)
+                        end
+                    else
+                        -- Only general filters active, no player/group mode
                         table.insert(passingEntries, entry)
                     end
                 end
@@ -580,7 +651,7 @@ local function ApplyAndRefresh()
     end
 
     -- Sort friend/guild entries to the top
-    SortSocialFirst(passingEntries)
+    SortEntries(passingEntries)
 
     local newDP = CreateDataProvider()
     if newDP then
@@ -698,9 +769,18 @@ end
 ----------------------------------------------------------------------
 -- CLEAR ALL FILTERS
 ----------------------------------------------------------------------
+local function ClearGeneralFilters()
+    bossProgressMode = "all"
+    for mode, btn in pairs(bossProgressButtons) do
+        btn.isActive = (mode == "all")
+        btn:UpdateVisual()
+    end
+end
+
 local function ClearAllFilters()
     ClearPlayerFilters()
     ClearGroupFilters()
+    ClearGeneralFilters()
     totalResultCount = 0
     if resultCountText then resultCountText:SetText("") end
 
@@ -1008,6 +1088,58 @@ local function CreateFilterPanel()
 
     yPos = yPos - 4
     CreateSeparator(filterPanel, yPos)
+    yPos = yPos - 10
+
+    ----------------------------------------------------------------
+    -- SECTION 3: BOSS PROGRESS (general filters)
+    ----------------------------------------------------------------
+    CreateSectionHeader(filterPanel, "Boss Progress", yPos)
+    yPos = yPos - 18
+
+    -- Boss progress filter
+    local progressLabel = filterPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    progressLabel:SetPoint("TOPLEFT", 16, yPos)
+    progressLabel:SetText("Dungeon Progress:")
+    progressLabel:SetTextColor(0.8, 0.8, 0.8)
+    yPos = yPos - 16
+
+    local progressData = {
+        { key = "all",     text = "All" },
+        { key = "fresh",   text = "Fresh" },
+        { key = "partial", text = "Partial" },
+    }
+
+    local PROGRESS_BTN_W = (INNER_WIDTH - 8) / 3
+    local PROGRESS_BTN_H = 26
+    local PROGRESS_COLOR = "B08030"
+
+    for i, pd in ipairs(progressData) do
+        local btn = CreateToggleButton(filterPanel, pd.text, PROGRESS_BTN_W, PROGRESS_BTN_H, PROGRESS_COLOR, nil)
+        btn:SetPoint("TOPLEFT", PADDING + (i - 1) * (PROGRESS_BTN_W + 4), yPos)
+
+        -- "All" starts active
+        if pd.key == "all" then
+            btn.isActive = true
+            btn:UpdateVisual()
+        end
+
+        btn.onToggle = function(isActive)
+            if bossProgressMode == pd.key then return end  -- already selected
+            -- Radio-button behavior: deactivate others
+            bossProgressMode = pd.key
+            for mode, otherBtn in pairs(bossProgressButtons) do
+                otherBtn.isActive = (mode == pd.key)
+                otherBtn:UpdateVisual()
+            end
+            ApplyAndRefresh()
+        end
+        bossProgressButtons[pd.key] = btn
+    end
+
+    yPos = yPos - PROGRESS_BTN_H - 4
+
+    yPos = yPos - 4
+    CreateSeparator(filterPanel, yPos)
     yPos = yPos - 14
 
     ----------------------------------------------------------------
@@ -1132,6 +1264,7 @@ local function DumpFrameInfo()
         if active then print("    Find Groups: " .. role .. " needed"); any = true end
     end
     if activeMaxLevel then print("    Max Level: " .. MAX_LEVEL); any = true end
+    if bossProgressMode ~= "all" then print("    Boss Progress: " .. bossProgressMode); any = true end
     if not any then print("    (none)") end
 
     -- Frame status
@@ -1207,9 +1340,10 @@ initFrame:SetScript("OnEvent", function(self, event, arg1)
         print("|cff00ff00[LFG Filter]|r loaded. Type /lfgf for commands.")
     end
 
-    -- Re-apply filters after search results update (only when filters are active)
+    -- Re-apply filters/sorting after search results update
+    -- Always run: even without filters, we sort social > groups > solo
     if event == "LFG_LIST_SEARCH_RESULTS_RECEIVED" then
-        if initialized and AnyFilterActive() and lfgBrowseFrame and lfgBrowseFrame:IsShown() then
+        if initialized and lfgBrowseFrame and lfgBrowseFrame:IsShown() then
             C_Timer.After(0.5, function()
                 if PlayerIsInGroup() then
                     ApplyFilters()
