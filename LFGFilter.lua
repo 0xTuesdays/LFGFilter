@@ -1,5 +1,5 @@
 ----------------------------------------------------------------------
--- LFG Filter v1.4.0 - TBC Anniversary Looking For Group Browser Filter
+-- LFG Filter v1.4.1 - TBC Anniversary Looking For Group Browser Filter
 -- Two filter modes:
 --   "Find Players" - Shows solo players matching class/role/level filters
 --   "Find Groups"  - Shows groups with available role slots
@@ -900,6 +900,14 @@ local function CreateFilterPanel()
     -- Only show filter panel when the Browse tab is active, not Create Listing
     lfgBrowseFrame:HookScript("OnShow", function()
         if not panelManuallyHidden then filterPanel:Show() end
+        -- Re-apply filters/sorting when the browse frame reopens.
+        -- Use ApplyFilters (not ApplyAndRefresh) to avoid triggering
+        -- Blizzard's search machinery which causes the spinning wheel.
+        C_Timer.After(0.3, function()
+            if lfgBrowseFrame and lfgBrowseFrame:IsShown() then
+                ApplyFilters()
+            end
+        end)
     end)
     lfgBrowseFrame:HookScript("OnHide", function() filterPanel:Hide() end)
     lfgParent:HookScript("OnHide", function() filterPanel:Hide() end)

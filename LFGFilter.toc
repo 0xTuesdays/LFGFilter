@@ -2,7 +2,8 @@
 ## Title: LFG Filter
 ## Notes: Adds class/role filtering, boss progress, and friend/guild highlighting to the TBC Anniversary LFG browser
 ## Author: Tuesdays
-## Version: 1.4.0
+## Version: 1.4.1
+## IconTexture: Interface\AddOns\LFGFilter\LFG_Filter_Icon_24x24
 ## SavedVariables: LFGFilterDB
 
 LFGFilter.lua
