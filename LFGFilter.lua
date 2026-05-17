@@ -4,8 +4,8 @@
 --   "Find Players" - Shows solo players matching class/role/level filters
 --   "Find Groups"  - Shows groups with available role slots
 -- General filters: boss progress (Fresh/Partial).
--- Sort order: friend/guild entries first (highlighted green), then groups,
---   then solo players.
+-- When filters are active, sort order: friend/guild first, then groups,
+--   then solo players. Friend/guild entries are always highlighted green.
 -- Auto-refresh removes stale/delisted entries every 30 seconds.
 -- Filters auto-apply on toggle. Preferences saved between sessions.
 -- Supports ElvUI and TukUI skinning when available.
@@ -87,6 +87,11 @@ local AUTO_REFRESH_INTERVAL = 30  -- seconds
 local autoRefreshElapsed = 0
 local isApplyingFilters = false
 
+-- Group join suppression: block automatic DataProvider updates for a window
+-- after joining a group, since touching the DataProvider during the transition
+-- causes Blizzard's "Searching..." spinner.
+local groupJoinSuppressUntil = 0
+
 -- Panel visibility state
 local panelManuallyHidden = false
 
@@ -122,6 +127,15 @@ local function PlayerIsInGroup()
     if _G.GetNumGroupMembers then
         return _G.GetNumGroupMembers() > 0
     end
+    return false
+end
+
+-- Returns true if automatic DataProvider updates should be suppressed
+-- (during the brief group join transition window only).
+-- Once the transition is complete, filters should work normally even in a group
+-- so that group leaders can use "Find Players" to recruit.
+local function ShouldSuppressAutoUpdate()
+    if GetTime() < groupJoinSuppressUntil then return true end
     return false
 end
 
@@ -409,22 +423,29 @@ local function ApplyFilters()
 
     SaveFilterState()
 
+    -- No filters active: nothing to do. Don't touch the DataProvider —
+    -- replacing it without filters causes issues with Blizzard's UI state.
+    if not AnyFilterActive() then
+        if resultCountText then resultCountText:SetText("") end
+        isApplyingFilters = false
+        return
+    end
+
     local dp = lfgScrollBox.GetDataProvider and lfgScrollBox:GetDataProvider()
     if not dp or not dp.Enumerate then
         isApplyingFilters = false
         return
     end
 
-    local filtersActive = AnyFilterActive()
     local findPlayers = AnyPlayerFilterActive()
     local findGroups = AnyGroupFilterActive()
 
-    local allEntries = {}
     local passingEntries = {}
     local validEntryCount = 0
+    totalResultCount = 0
 
     for idx, entry in dp:Enumerate() do
-        table.insert(allEntries, entry)
+        totalResultCount = totalResultCount + 1
 
         if type(entry) == "table" and entry.resultID then
             local rid = entry.resultID
@@ -441,10 +462,6 @@ local function ApplyFilters()
                 -- Entry no longer valid
             elseif info.isDelisted then
                 -- Explicitly delisted
-            elseif not filtersActive then
-                -- No filters: include all valid entries (still need social sort)
-                validEntryCount = validEntryCount + 1
-                table.insert(passingEntries, entry)
             else
                 validEntryCount = validEntryCount + 1
 
@@ -478,7 +495,12 @@ local function ApplyFilters()
         end
     end
 
-    totalResultCount = #allEntries
+    -- Don't touch the DataProvider if it's empty — a search is likely in progress
+    -- and setting an empty DP here will prevent Blizzard from showing results when done.
+    if totalResultCount == 0 then
+        isApplyingFilters = false
+        return
+    end
 
     -- Safety: only bail out if ALL entries were stale/invalid (no valid entries found).
     if #passingEntries == 0 and validEntryCount == 0 and totalResultCount > 0 then
@@ -486,42 +508,16 @@ local function ApplyFilters()
         return
     end
 
-    -- Check if any entries need reordering (social members or mixed groups/solo)
-    local needsSort = false
-    for _, entry in ipairs(passingEntries) do
-        if HasSocialMembers(entry.resultID) then
-            needsSort = true
-            break
-        end
-    end
-    if not needsSort and #passingEntries > 1 then
-        -- Check for mixed groups + solo players that need sorting
-        local hasGroup, hasSolo = false, false
-        for _, entry in ipairs(passingEntries) do
-            local ok, info = pcall(C_LFGList.GetSearchResultInfo, entry.resultID)
-            if ok and type(info) == "table" then
-                if (info.numMembers or 0) >= 2 then hasGroup = true else hasSolo = true end
-                if hasGroup and hasSolo then needsSort = true; break end
-            end
-        end
-    end
+    SortEntries(passingEntries)
 
-    -- Only replace DataProvider if we need to (filters active or sort needed).
-    -- Unnecessary replacements can cause Blizzard UI errors with stale entries.
-    if filtersActive or needsSort then
-        SortEntries(passingEntries)
-
-        local newDP = CreateDataProvider()
-        if newDP then
-            newDP:InsertTable(passingEntries)
-            lfgScrollBox:SetDataProvider(newDP)
-        end
+    local newDP = CreateDataProvider()
+    if newDP then
+        newDP:InsertTable(passingEntries)
+        lfgScrollBox:SetDataProvider(newDP)
     end
 
     if resultCountText then
-        if not filtersActive then
-            resultCountText:SetText("")
-        elseif findPlayers then
+        if findPlayers then
             resultCountText:SetText(format("Showing %d players of %d listings", #passingEntries, totalResultCount))
         elseif findGroups then
             resultCountText:SetText(format("Showing %d groups of %d listings", #passingEntries, totalResultCount))
@@ -901,10 +897,9 @@ local function CreateFilterPanel()
     lfgBrowseFrame:HookScript("OnShow", function()
         if not panelManuallyHidden then filterPanel:Show() end
         -- Re-apply filters/sorting when the browse frame reopens.
-        -- Use ApplyFilters (not ApplyAndRefresh) to avoid triggering
-        -- Blizzard's search machinery which causes the spinning wheel.
+        -- Skip during group join transitions to avoid the spinner.
         C_Timer.After(0.3, function()
-            if lfgBrowseFrame and lfgBrowseFrame:IsShown() then
+            if lfgBrowseFrame and lfgBrowseFrame:IsShown() and not ShouldSuppressAutoUpdate() then
                 ApplyFilters()
             end
         end)
@@ -1132,7 +1127,12 @@ local function CreateFilterPanel()
         end
 
         btn.onToggle = function(isActive)
-            if bossProgressMode == pd.key then return end  -- already selected
+            if bossProgressMode == pd.key then
+                -- Already selected: radio buttons can't be deselected, re-activate
+                btn.isActive = true
+                btn:UpdateVisual()
+                return
+            end
             -- Radio-button behavior: deactivate others
             bossProgressMode = pd.key
             for mode, otherBtn in pairs(bossProgressButtons) do
@@ -1183,10 +1183,10 @@ local function CreateFilterPanel()
         autoRefreshElapsed = autoRefreshElapsed + elapsed
         if autoRefreshElapsed >= AUTO_REFRESH_INTERVAL then
             autoRefreshElapsed = 0
-            if PlayerIsInGroup() then
+            -- Skip during group join transitions — touching the DataProvider
+            -- can cause the "Searching..." spinner.
+            if not ShouldSuppressAutoUpdate() then
                 ApplyFilters()
-            else
-                ApplyAndRefresh()
             end
         end
     end)
@@ -1338,9 +1338,13 @@ local initFrame = CreateFrame("Frame")
 initFrame:RegisterEvent("ADDON_LOADED")
 initFrame:RegisterEvent("LFG_UPDATE")
 initFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+initFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
 initFrame:RegisterEvent("LFG_LIST_SEARCH_RESULTS_RECEIVED")
 
 local initialized = false
+-- Initialize from current state so a /reload while in a group doesn't
+-- falsely trigger the join-transition suppression window.
+local wasInGroup = (_G.GetNumGroupMembers and _G.GetNumGroupMembers() > 0) or false
 
 initFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" and arg1 == addonName then
@@ -1348,18 +1352,33 @@ initFrame:SetScript("OnEvent", function(self, event, arg1)
         print("|cff00ff00[LFG Filter]|r loaded. Type /lfgf for commands.")
     end
 
-    -- Re-apply filters/sorting after search results update
-    -- Always run: even without filters, we sort social > groups > solo
+    -- Re-apply filters after search results update, but SKIP during group
+    -- join transitions to avoid the "Searching..." spinner.
     if event == "LFG_LIST_SEARCH_RESULTS_RECEIVED" then
         if initialized and lfgBrowseFrame and lfgBrowseFrame:IsShown() then
-            C_Timer.After(0.5, function()
-                if PlayerIsInGroup() then
-                    ApplyFilters()
-                else
-                    ApplyAndRefresh()
-                end
-            end)
+            if not ShouldSuppressAutoUpdate() then
+                C_Timer.After(0.5, function()
+                    if lfgBrowseFrame and lfgBrowseFrame:IsShown() and not ShouldSuppressAutoUpdate() then
+                        ApplyFilters()
+                    end
+                end)
+            end
         end
+        return
+    end
+
+    -- Detect group join transitions: set a suppression window to prevent
+    -- any automatic DataProvider updates that cause the "Searching..." spinner.
+    if event == "GROUP_ROSTER_UPDATE" then
+        local inGroup = PlayerIsInGroup()
+        if inGroup and not wasInGroup then
+            -- Just joined a group: suppress automatic updates for 10 seconds
+            groupJoinSuppressUntil = GetTime() + 10
+        elseif inGroup and GetTime() < groupJoinSuppressUntil then
+            -- Multiple roster updates during group formation: keep extending the window
+            groupJoinSuppressUntil = GetTime() + 10
+        end
+        wasInGroup = inGroup
         return
     end
 
